@@ -56,7 +56,7 @@ def LeViT_192(num_classes=1000, distillation=True,
 
 @register_model
 def LeViT_256(num_classes=1000, distillation=True,
-              pretrained=False, pretrained_cfg=None, fuse=False):
+              pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, fuse=False):
     return model_factory(**specification['LeViT_256'], num_classes=num_classes,
                          distillation=distillation, pretrained=pretrained, fuse=fuse)
 
@@ -178,10 +178,19 @@ class Residual(torch.nn.Module):
         self.m = m
         self.drop = drop
 
-    def forward(self, x):
+    def forward(self,x,attn_policy, token_select):
+        print(type(self.m))
+        print(isinstance(self.m, Attention))
+        if isinstance(self.m,Attention):
+            if self.training and self.drop > 0:
+                return x + self.m(x) * torch.rand(x.size(0), 1, 1,
+                                                device=x.device).ge_(self.drop).div(1 - self.drop).detach()
+            else:
+                return x + self.m(x,attn_policy,token_select)
+    
         if self.training and self.drop > 0:
             return x + self.m(x) * torch.rand(x.size(0), 1, 1,
-                                              device=x.device).ge_(self.drop).div(1 - self.drop).detach()
+                                                  device=x.device).ge_(self.drop).div(1 - self.drop).detach()
         else:
             return x + self.m(x)
 
@@ -199,6 +208,7 @@ class Attention(torch.nn.Module):
         self.d = int(attn_ratio * key_dim)
         self.dh = int(attn_ratio * key_dim) * num_heads
         self.attn_ratio = attn_ratio
+        self.mask_filled_value = float('-inf')
         h = self.dh + nh_kd * 2
         self.qkv = Linear_BN(dim, h, resolution=resolution)
         self.proj = torch.nn.Sequential(activation(), Linear_BN(
@@ -235,7 +245,7 @@ class Attention(torch.nn.Module):
         else:
             self.ab = self.attention_biases[:, self.attention_bias_idxs]
 
-    def forward(self, x):  # x (B,N,C)
+    def forward(self, x,attn_policy,token_select):  # x (B,N,C)
         B, N, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.view(B, N, self.num_heads, -
@@ -250,10 +260,28 @@ class Attention(torch.nn.Module):
             (self.attention_biases[:, self.attention_bias_idxs]
              if self.training else self.ab)
         )
+        print(q.shape)
+        print(k.shape)
+        print(v.shape)
+        print(attn.shape)
+        print(attn_policy.shape)
+        attn_policy = attn_policy.unsqueeze(1)
+        print(attn_policy.shape)
+
+        eye_mat = attn.new_zeros((N,N))
+        print(eye_mat.shape)
+        eye_mat = eye_mat.fill_diagonal_(1)
+        
+        attn = attn * attn_policy + attn.new_zeros(
+            attn.shape).masked_fill_((1 - attn_policy - eye_mat) > 0, self.mask_filled_value)
+        
+        
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
         x = self.proj(x)
+        #x=x*token_select
         return x
+
 
 
 class Subsample(torch.nn.Module):
@@ -344,14 +372,44 @@ class AttentionSubsample(torch.nn.Module):
         q = self.q(x).view(B, self.resolution_2, self.num_heads,
                            self.key_dim).permute(0, 2, 1, 3)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale + \
-            (self.attention_biases[:, self.attention_bias_idxs]
-             if self.training else self.ab)
+        attn = (q @ k.transpose(-2, -1)) * self.scale + (self.attention_biases[:, self.attention_bias_idxs] if self.training else self.ab)
         attn = attn.softmax(dim=-1)
 
         x = (attn @ v).transpose(1, 2).reshape(B, -1, self.dh)
         x = self.proj(x)
         return x
+
+
+def _gumbel_sigmoid(logits, tau=1, hard=False, eps=1e-10, training=True, threshold=0.5):
+    if training:
+        # ~Gumbel(0,1)`
+        gumbels1 = (
+            -torch.empty_like(logits,
+                              memory_format=torch.legacy_contiguous_format)
+            .exponential_()
+            .log()
+        )
+        gumbels2 = (
+            -torch.empty_like(logits,
+                              memory_format=torch.legacy_contiguous_format)
+            .exponential_()
+            .log()
+        )
+        # Difference of two` gumbels because we apply a sigmoid
+        gumbels1 = (logits + gumbels1 - gumbels2) / tau
+        y_soft = gumbels1.sigmoid()
+    else:
+        y_soft = logits.sigmoid()
+
+    if hard:
+        # Straight through.
+        y_hard = torch.zeros_like(
+            logits, memory_format=torch.legacy_contiguous_format
+        ).masked_fill(y_soft > threshold, 1.0)
+        ret = y_hard - y_soft.detach() + y_soft
+    else:
+        ret = y_soft
+    return ret
 
 
 class LeViT(torch.nn.Module):
@@ -383,6 +441,8 @@ class LeViT(torch.nn.Module):
         self.distillation = distillation
 
         self.patch_embed = hybrid_backbone
+        self.mlp=torch.nn.Linear(embed_dim[0],1)
+        self.norm = torch.nn.Identity()
 
         self.blocks = []
         down_ops.append([''])
@@ -428,7 +488,7 @@ class LeViT(torch.nn.Module):
                             Linear_BN(
                                 h, embed_dim[i + 1], bn_weight_init=0, resolution=resolution),
                         ), drop_path))
-        self.blocks = torch.nn.Sequential(*self.blocks)
+        self.blocks = torch.nn.ModuleList(self.blocks)
 
         # Classifier head
         self.head = BN_Linear(
@@ -445,9 +505,24 @@ class LeViT(torch.nn.Module):
         return {x for x in self.state_dict().keys() if 'attention_biases' in x}
 
     def forward(self, x):
+        b=x.shape[0]
         x = self.patch_embed(x)
         x = x.flatten(2).transpose(1, 2)
-        x = self.blocks(x)
+        
+        logits=self.mlp(self.norm(x[:,1:]))
+        token_select=_gumbel_sigmoid(logits,hard=True,training=self.training)
+        token_select = torch.cat([token_select.new_ones(b,1,1), token_select], dim=1)
+        print(x.shape)
+
+        x=x*token_select
+        print(token_select.shape)
+        attn_policy = token_select@token_select.transpose(-2,-1)
+        print(attn_policy.shape)
+        for b in self.blocks:
+            print(type(b))
+            x=b(x,attn_policy,token_select)
+            x = x*token_select
+        print(x)
         x = x.mean(1)
         if self.distillation:
             x = self.head(x), self.head_dist(x)
@@ -455,7 +530,7 @@ class LeViT(torch.nn.Module):
                 x = (x[0] + x[1]) / 2
         else:
             x = self.head(x)
-        return x
+        return x,token_select[:,1:]
 
 
 def model_factory(C, D, X, N, drop_path, weights,
@@ -482,12 +557,12 @@ def model_factory(C, D, X, N, drop_path, weights,
         hybrid_backbone=b16(embed_dim[0], activation=act),
         num_classes=num_classes,
         drop_path=drop_path,
-        distillation=distillation
+        #distillation=distillation
     )
     if pretrained:
         checkpoint = torch.hub.load_state_dict_from_url(
             weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['model'],strict=False)
     if fuse:
         utils.replace_batchnorm(model)
 

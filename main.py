@@ -135,7 +135,7 @@ def get_args_parser():
                         help='Name of teacher model to train (default: "regnety_160"')
     parser.add_argument('--teacher-path', type=str,
                         default='https://dl.fbaipublicfiles.com/deit/regnety_160-a5fe301d.pth')
-    parser.add_argument('--distillation-type', default='hard',
+    parser.add_argument('--distillation-type', default='none',
                         choices=['none', 'soft', 'hard'], type=str, help="")
     parser.add_argument('--distillation-alpha',
                         default=0.5, type=float, help="")
@@ -179,6 +179,8 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    
+    parser.add_argument('--patch-ratio', default=0.6,type=float,help='patch ratio')
     return parser
 
 
@@ -193,6 +195,7 @@ def main(args):
 
     device = torch.device(args.device)
 
+
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -204,7 +207,7 @@ def main(args):
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
-    if True:  # args.distributed:
+    if args.distributed:  # args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
@@ -376,7 +379,7 @@ def main(args):
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, args.clip_mode, model_ema, mixup_fn,
-            set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
+            set_training_mode=args.finetune == '', patch_ratio=patch_ratio  # keep in eval mode during finetuning
         )
 
         lr_scheduler.step(epoch)

@@ -16,13 +16,17 @@ from losses import DistillationLoss
 import utils
 
 
+def criterion_token(tokens_select,patch_ratio):
+    return torch.mean((torch.mean(tokens_select,dim=1)-patch_ratio)**2)
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     clip_grad: float = 0,
                     clip_mode: str = 'norm',
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True):
+                    set_training_mode=True,patch_ratio=0.6):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(
@@ -39,10 +43,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             samples, targets = mixup_fn(samples, targets)
 
         if True:  # with torch.cuda.amp.autocast():
-            outputs = model(samples)
+            outputs,token_select = model(samples)
             loss = criterion(samples, outputs, targets)
+            loss_token=criterion_token(token_select,patch_ratio)
 
-        loss_value = loss.item()
+        loss_value = loss.item()+loss_token.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -84,7 +89,7 @@ def evaluate(data_loader, model, device):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output = model(images)
+            output,token_select = model(images)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
