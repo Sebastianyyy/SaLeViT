@@ -260,16 +260,9 @@ class Attention(torch.nn.Module):
             (self.attention_biases[:, self.attention_bias_idxs]
              if self.training else self.ab)
         )
-        print(q.shape)
-        print(k.shape)
-        print(v.shape)
-        print(attn.shape)
-        print(attn_policy.shape)
         attn_policy = attn_policy.unsqueeze(1)
-        print(attn_policy.shape)
 
         eye_mat = attn.new_zeros((N,N))
-        print(eye_mat.shape)
         eye_mat = eye_mat.fill_diagonal_(1)
         
         attn = attn * attn_policy + attn.new_zeros(
@@ -290,11 +283,12 @@ class Subsample(torch.nn.Module):
         self.stride = stride
         self.resolution = resolution
 
-    def forward(self, x):
+    def forward(self, x,token_select):
         B, N, C = x.shape
         x = x.view(B, self.resolution, self.resolution, C)[
             :, ::self.stride, ::self.stride].reshape(B, -1, C)
-        return x
+        token_select=token_select.view(B,self.resolution,self.resolution,1)[:,::self.stride,::self.stride].reshape(B,-1,1)
+        return x,token_select
 
 
 class AttentionSubsample(torch.nn.Module):
@@ -313,12 +307,16 @@ class AttentionSubsample(torch.nn.Module):
         self.attn_ratio = attn_ratio
         self.resolution_ = resolution_
         self.resolution_2 = resolution_**2
+        self.mask_filled_value = float('-inf')
+
         h = self.dh + nh_kd
         self.kv = Linear_BN(in_dim, h, resolution=resolution)
 
-        self.q = torch.nn.Sequential(
-            Subsample(stride, resolution),
-            Linear_BN(in_dim, nh_kd, resolution=resolution_))
+        # self.q = torch.nn.Sequential(
+        #     Subsample(stride, resolution),
+        #     Linear_BN(in_dim, nh_kd, resolution=resolution_))
+        self.sample=Subsample(stride,resolution)
+        self.q=Linear_BN(in_dim,nh_kd,resolution=resolution_)
         self.proj = torch.nn.Sequential(activation(), Linear_BN(
             self.dh, out_dim, resolution=resolution_))
 
@@ -363,21 +361,39 @@ class AttentionSubsample(torch.nn.Module):
         else:
             self.ab = self.attention_biases[:, self.attention_bias_idxs]
 
-    def forward(self, x):
+    def forward(self, x, attn_policy, token_select):
         B, N, C = x.shape
         k, v = self.kv(x).view(B, N, self.num_heads, -
                                1).split([self.key_dim, self.d], dim=3)
         k = k.permute(0, 2, 1, 3)  # BHNC
         v = v.permute(0, 2, 1, 3)  # BHNC
-        q = self.q(x).view(B, self.resolution_2, self.num_heads,
-                           self.key_dim).permute(0, 2, 1, 3)
+        sample,token_select_=self.sample(x,token_select)
+        q=self.q(sample).view(B,self.resolution_2,self.num_heads,self.key_dim).permute(0,2,1,3)
+        # q = self.q(x).view(B, self.resolution_2, self.num_heads,
+        #                    self.key_dim).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale + (self.attention_biases[:, self.attention_bias_idxs] if self.training else self.ab)
-        attn = attn.softmax(dim=-1)
+        # attn = attn.softmax(dim=-1)
+        
+        # x = (attn @ v).transpose(1, 2).reshape(B, -1, self.dh)
+        # x = self.proj(x)
+        attn_policy_ = token_select_@token_select_.transpose(-2, -1)
 
+        attn_policy = token_select_@token_select.transpose(-2, -1)
+
+        attn_policy = attn_policy.unsqueeze(1)
+
+        eye_mat = attn.new_zeros((self.resolution_**2, N))
+        eye_mat[:,::4]=1
+
+        attn = attn * attn_policy + attn.new_zeros(
+            attn.shape).masked_fill_((1 - attn_policy - eye_mat) > 0, self.mask_filled_value)
+
+        attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, -1, self.dh)
         x = self.proj(x)
-        return x
+        # x=x*token_select
+        return x, token_select_, attn_policy_
 
 
 def _gumbel_sigmoid(logits, tau=1, hard=False, eps=1e-10, training=True, threshold=0.5):
@@ -512,15 +528,14 @@ class LeViT(torch.nn.Module):
         logits=self.mlp(self.norm(x[:,1:]))
         token_select=_gumbel_sigmoid(logits,hard=True,training=self.training)
         token_select = torch.cat([token_select.new_ones(b,1,1), token_select], dim=1)
-        print(x.shape)
-
         x=x*token_select
-        print(token_select.shape)
+        t_s=token_select
         attn_policy = token_select@token_select.transpose(-2,-1)
-        print(attn_policy.shape)
         for b in self.blocks:
-            print(type(b))
-            x=b(x,attn_policy,token_select)
+            if isinstance(b,AttentionSubsample):
+                x,token_select,attn_policy=b(x,attn_policy,token_select)
+            else:
+                x=b(x,attn_policy,token_select)
             x = x*token_select
         print(x)
         x = x.mean(1)
@@ -530,7 +545,8 @@ class LeViT(torch.nn.Module):
                 x = (x[0] + x[1]) / 2
         else:
             x = self.head(x)
-        return x,token_select[:,1:]
+        
+        return x,t_s[:,1:]
 
 
 def model_factory(C, D, X, N, drop_path, weights,

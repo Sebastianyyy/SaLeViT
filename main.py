@@ -379,7 +379,7 @@ def main(args):
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, args.clip_mode, model_ema, mixup_fn,
-            set_training_mode=args.finetune == '', patch_ratio=patch_ratio  # keep in eval mode during finetuning
+            set_training_mode=args.finetune == '', patch_ratio=args.patch_ratio  # keep in eval mode during finetuning
         )
 
         lr_scheduler.step(epoch)

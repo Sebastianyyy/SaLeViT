@@ -17,8 +17,11 @@ import utils
 
 
 def criterion_token(tokens_select,patch_ratio):
-    return torch.mean((torch.mean(tokens_select,dim=1)-patch_ratio)**2)
+    token_mean = tokens_select.mean()
+    token_flops_loss = ((token_mean - patch_ratio)**2).mean()
 
+    token_loss = token_flops_loss 
+    return token_loss
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -74,7 +77,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device):
+def evaluate(data_loader, model, device, patch_ratio=0.6):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -91,6 +94,10 @@ def evaluate(data_loader, model, device):
         with torch.cuda.amp.autocast():
             output,token_select = model(images)
             loss = criterion(output, target)
+            loss_token = criterion_token(token_select, patch_ratio)
+
+        loss_value = loss.item()+loss_token.item()
+
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
