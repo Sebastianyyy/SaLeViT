@@ -7,10 +7,17 @@
 
 import torch
 import itertools
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional
 import utils
+import torchvision
 
 from timm.models.vision_transformer import trunc_normal_
 from timm.models.registry import register_model
+
+from torchvision.models.shufflenetv2 import (ShuffleNet_V2_X0_5_Weights,
+                                             ShuffleNetV2, shufflenet_v2_x0_5)
+
 
 specification = {
     'LeViT_128S': {
@@ -178,19 +185,17 @@ class Residual(torch.nn.Module):
         self.m = m
         self.drop = drop
 
-    def forward(self,x,attn_policy, token_select):
-        print(type(self.m))
-        print(isinstance(self.m, Attention))
-        if isinstance(self.m,Attention):
+    def forward(self, x, attn_policy, token_select):
+        if isinstance(self.m, Attention):
             if self.training and self.drop > 0:
                 return x + self.m(x) * torch.rand(x.size(0), 1, 1,
-                                                device=x.device).ge_(self.drop).div(1 - self.drop).detach()
+                                                  device=x.device).ge_(self.drop).div(1 - self.drop).detach()
             else:
-                return x + self.m(x,attn_policy,token_select)
-    
+                return x + self.m(x, attn_policy, token_select)
+
         if self.training and self.drop > 0:
             return x + self.m(x) * torch.rand(x.size(0), 1, 1,
-                                                  device=x.device).ge_(self.drop).div(1 - self.drop).detach()
+                                              device=x.device).ge_(self.drop).div(1 - self.drop).detach()
         else:
             return x + self.m(x)
 
@@ -230,11 +235,11 @@ class Attention(torch.nn.Module):
                              torch.LongTensor(idxs).view(N, N))
 
         global FLOPS_COUNTER
-        #queries * keys
+        # queries * keys
         FLOPS_COUNTER += num_heads * (resolution**4) * key_dim
         # softmax
         FLOPS_COUNTER += num_heads * (resolution**4)
-        #attention * v
+        # attention * v
         FLOPS_COUNTER += num_heads * self.d * (resolution**4)
 
     @torch.no_grad()
@@ -245,7 +250,7 @@ class Attention(torch.nn.Module):
         else:
             self.ab = self.attention_biases[:, self.attention_bias_idxs]
 
-    def forward(self, x,attn_policy,token_select):  # x (B,N,C)
+    def forward(self, x, attn_policy, token_select):  # x (B,N,C)
         B, N, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.view(B, N, self.num_heads, -
@@ -262,19 +267,17 @@ class Attention(torch.nn.Module):
         )
         attn_policy = attn_policy.unsqueeze(1)
 
-        eye_mat = attn.new_zeros((N,N))
+        eye_mat = attn.new_zeros((N, N))
         eye_mat = eye_mat.fill_diagonal_(1)
-        
+
         attn = attn * attn_policy + attn.new_zeros(
             attn.shape).masked_fill_((1 - attn_policy - eye_mat) > 0, self.mask_filled_value)
-        
-        
+
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
         x = self.proj(x)
-        #x=x*token_select
+        # x=x*token_select
         return x
-
 
 
 class Subsample(torch.nn.Module):
@@ -283,12 +286,13 @@ class Subsample(torch.nn.Module):
         self.stride = stride
         self.resolution = resolution
 
-    def forward(self, x,token_select):
+    def forward(self, x, token_select):
         B, N, C = x.shape
         x = x.view(B, self.resolution, self.resolution, C)[
             :, ::self.stride, ::self.stride].reshape(B, -1, C)
-        token_select=token_select.view(B,self.resolution,self.resolution,1)[:,::self.stride,::self.stride].reshape(B,-1,1)
-        return x,token_select
+        token_select = token_select.view(B, self.resolution, self.resolution, 1)[
+            :, ::self.stride, ::self.stride].reshape(B, -1, 1)
+        return x, token_select
 
 
 class AttentionSubsample(torch.nn.Module):
@@ -315,8 +319,8 @@ class AttentionSubsample(torch.nn.Module):
         # self.q = torch.nn.Sequential(
         #     Subsample(stride, resolution),
         #     Linear_BN(in_dim, nh_kd, resolution=resolution_))
-        self.sample=Subsample(stride,resolution)
-        self.q=Linear_BN(in_dim,nh_kd,resolution=resolution_)
+        self.sample = Subsample(stride, resolution)
+        self.q = Linear_BN(in_dim, nh_kd, resolution=resolution_)
         self.proj = torch.nn.Sequential(activation(), Linear_BN(
             self.dh, out_dim, resolution=resolution_))
 
@@ -344,12 +348,12 @@ class AttentionSubsample(torch.nn.Module):
                              torch.LongTensor(idxs).view(N_, N))
 
         global FLOPS_COUNTER
-        #queries * keys
+        # queries * keys
         FLOPS_COUNTER += num_heads * \
             (resolution**2) * (resolution_**2) * key_dim
         # softmax
         FLOPS_COUNTER += num_heads * (resolution**2) * (resolution_**2)
-        #attention * v
+        # attention * v
         FLOPS_COUNTER += num_heads * \
             (resolution**2) * (resolution_**2) * self.d
 
@@ -367,14 +371,17 @@ class AttentionSubsample(torch.nn.Module):
                                1).split([self.key_dim, self.d], dim=3)
         k = k.permute(0, 2, 1, 3)  # BHNC
         v = v.permute(0, 2, 1, 3)  # BHNC
-        sample,token_select_=self.sample(x,token_select)
-        q=self.q(sample).view(B,self.resolution_2,self.num_heads,self.key_dim).permute(0,2,1,3)
+        sample, token_select_ = self.sample(x, token_select)
+        q = self.q(sample).view(B, self.resolution_2,
+                                self.num_heads, self.key_dim).permute(0, 2, 1, 3)
         # q = self.q(x).view(B, self.resolution_2, self.num_heads,
         #                    self.key_dim).permute(0, 2, 1, 3)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale + (self.attention_biases[:, self.attention_bias_idxs] if self.training else self.ab)
+        attn = (q @ k.transpose(-2, -1)) * self.scale + \
+            (self.attention_biases[:, self.attention_bias_idxs]
+             if self.training else self.ab)
         # attn = attn.softmax(dim=-1)
-        
+
         # x = (attn @ v).transpose(1, 2).reshape(B, -1, self.dh)
         # x = self.proj(x)
         attn_policy_ = token_select_@token_select_.transpose(-2, -1)
@@ -384,7 +391,7 @@ class AttentionSubsample(torch.nn.Module):
         attn_policy = attn_policy.unsqueeze(1)
 
         eye_mat = attn.new_zeros((self.resolution_**2, N))
-        eye_mat[:,::4]=1
+        eye_mat[:, ::4] = 1
 
         attn = attn * attn_policy + attn.new_zeros(
             attn.shape).masked_fill_((1 - attn_policy - eye_mat) > 0, self.mask_filled_value)
@@ -428,6 +435,31 @@ def _gumbel_sigmoid(logits, tau=1, hard=False, eps=1e-10, training=True, thresho
     return ret
 
 
+class ExtractionModel(torch.nn.Module):
+    def __init__(self,device):
+        super().__init__()
+        self.model = shufflenet_v2_x0_5(
+        weights=ShuffleNet_V2_X0_5_Weights.DEFAULT)
+        self.device=device
+        if isinstance(self.model, ShuffleNetV2) and hasattr(self.model, "fc"):
+            del self.model.fc  # saves GPU space
+
+        model_device = next(self.model.parameters()).device
+        if self.device != model_device:
+            self.model = self.model.to(self.device)
+
+        self.model = self.model.eval()
+    @torch.no_grad()
+    def forward(self, x):
+        x = self.model.conv1(x)
+        x = self.model.maxpool(x)
+        x = self.model.stage2(x)
+        x = self.model.stage3(x)
+        x = self.model.stage4(x)
+        x = self.model.conv5(x)
+        return x
+
+
 class LeViT(torch.nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -447,7 +479,8 @@ class LeViT(torch.nn.Module):
                  attention_activation=torch.nn.Hardswish,
                  mlp_activation=torch.nn.Hardswish,
                  distillation=True,
-                 drop_path=0):
+                 drop_path=0,
+                 device='cpu'):
         super().__init__()
         global FLOPS_COUNTER
 
@@ -457,10 +490,12 @@ class LeViT(torch.nn.Module):
         self.distillation = distillation
 
         self.patch_embed = hybrid_backbone
-        self.mlp=torch.nn.Linear(embed_dim[0],1)
+        self.mlp = torch.nn.Linear(embed_dim[0], 1)
         self.norm = torch.nn.Identity()
 
         self.blocks = []
+        self.scale_size = 128
+                
         down_ops.append([''])
         resolution = img_size // patch_size
         for i, (ed, kd, dpth, nh, ar, mr, do) in enumerate(
@@ -483,7 +518,7 @@ class LeViT(torch.nn.Module):
                                       resolution=resolution),
                         ), drop_path))
             if do[0] == 'Subsample':
-                #('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
+                # ('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
                 resolution_ = (resolution - 1) // do[5] + 1
                 self.blocks.append(
                     AttentionSubsample(
@@ -520,24 +555,83 @@ class LeViT(torch.nn.Module):
     def no_weight_decay(self):
         return {x for x in self.state_dict().keys() if 'attention_biases' in x}
 
-    def forward(self, x):
-        b=x.shape[0]
-        x = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
+    def blury_image(self, x, size):
+        original_size = x.shape[-1]
+        return torchvision.transforms.functional.resize(torchvision.transforms.functional.resize(x, size,antialias=True), original_size,antialias=True)        
+    
+
+    def show_image(self,tensor):
+        numpy_img = tensor.cpu().numpy()
+
+        if len(numpy_img.shape) == 4:
+            numpy_img = numpy_img[0]
+        numpy_img = numpy_img.transpose((1, 2, 0))
+
+        if numpy_img.shape[2] == 1:
+            numpy_img = numpy_img.squeeze()
+
+        plt.imshow(numpy_img)
+        plt.show()
+
+    def show_map(self, tensor,feature_map):
+        numpy_img = tensor.cpu().numpy()
+        numpy_map = feature_map.cpu().numpy()
         
-        logits=self.mlp(self.norm(x[:,1:]))
-        token_select=_gumbel_sigmoid(logits,hard=True,training=self.training)
-        token_select = torch.cat([token_select.new_ones(b,1,1), token_select], dim=1)
-        x=x*token_select
-        t_s=token_select
-        attn_policy = token_select@token_select.transpose(-2,-1)
+        if len(numpy_img.shape) == 4:
+            numpy_img = numpy_img[0]
+            numpy_map=numpy_map[0]
+        numpy_img = numpy_img.transpose((1, 2, 0))
+        numpy_map=numpy_map.transpose((1,2,0))
+        
+        if numpy_img.shape[2] == 1:
+            numpy_img = numpy_img.squeeze()
+        if numpy_map.shape[2]==1:
+            numpy_map=numpy_map.squeeze()
+            
+        plt.imshow(numpy_img)
+        plt.imshow(numpy_map,alpha=0.5)
+        plt.show()
+
+    
+    @torch.no_grad()
+    def compute_errors(self,blured,image):
+        squared_error = (blured - image) ** 2
+        error = squared_error.mean(dim=1)
+        return error                
+
+    def forward(self, x, features_extract):
+        b = x.shape[0]
+        
+        blured = self.blury_image(x, self.scale_size)
+
+        blured_features=features_extract(blured)
+        image_features = features_extract(x)
+        
+        err = self.compute_errors(blured_features, image_features)
+        self.show_image(blured)
+
+        err_show =err.repeat_interleave(32, dim=1).repeat_interleave(32, dim=2)
+        err_show = err_show[:, None, :, :]
+        self.show_map(blured,err_show)
+        
+        x = self.patch_embed(x)
+
+        x = x.flatten(2).transpose(1, 2)
+
+        logits = self.mlp(self.norm(x[:, 1:]))
+        token_select = _gumbel_sigmoid(
+            logits, hard=True, training=self.training)
+        token_select = torch.cat(
+            [token_select.new_ones(b, 1, 1), token_select], dim=1)
+        x = x*token_select
+        t_s = token_select
+        attn_policy = token_select@token_select.transpose(-2, -1)
         for b in self.blocks:
-            if isinstance(b,AttentionSubsample):
-                x,token_select,attn_policy=b(x,attn_policy,token_select)
+            if isinstance(b, AttentionSubsample):
+                x, token_select, attn_policy = b(x, attn_policy, token_select)
             else:
-                x=b(x,attn_policy,token_select)
-            #x = x*token_select
-        print(x)
+                x = b(x, attn_policy, token_select)
+            # x = x*token_select
         x = x.mean(1)
         if self.distillation:
             x = self.head(x), self.head_dist(x)
@@ -545,8 +639,8 @@ class LeViT(torch.nn.Module):
                 x = (x[0] + x[1]) / 2
         else:
             x = self.head(x)
-        
-        return x,t_s[:,1:]
+
+        return x, t_s[:, 1:]
 
 
 def model_factory(C, D, X, N, drop_path, weights,
@@ -564,7 +658,7 @@ def model_factory(C, D, X, N, drop_path, weights,
         attn_ratio=[2, 2, 2],
         mlp_ratio=[2, 2, 2],
         down_ops=[
-            #('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
+            # ('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
             ['Subsample', D, embed_dim[0] // D, 4, 2, 2],
             ['Subsample', D, embed_dim[1] // D, 4, 2, 2],
         ],
@@ -573,16 +667,18 @@ def model_factory(C, D, X, N, drop_path, weights,
         hybrid_backbone=b16(embed_dim[0], activation=act),
         num_classes=num_classes,
         drop_path=drop_path,
-        #distillation=distillation
+        # distillation=distillation
     )
     if pretrained:
         checkpoint = torch.hub.load_state_dict_from_url(
             weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model'],strict=False)
+        model.load_state_dict(checkpoint['model'], strict=False)
     if fuse:
         utils.replace_batchnorm(model)
 
     return model
+
+
 
 
 if __name__ == '__main__':

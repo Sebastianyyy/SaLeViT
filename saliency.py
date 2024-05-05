@@ -22,9 +22,11 @@ from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
-import levit
+#import levit
+import saliencylevit
 import levit_c
 import utils
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser(
@@ -178,8 +180,9 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
-    
-    parser.add_argument('--patch-ratio', default=0.6,type=float,help='patch ratio')
+
+    parser.add_argument('--patch-ratio', default=0.6,
+                        type=float, help='patch ratio')
     return parser
 
 
@@ -193,7 +196,6 @@ def main(args):
             "Finetuning with distillation not yet supported")
 
     device = torch.device(args.device)
-
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -361,8 +363,12 @@ def main(args):
                     model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
+    
+    feature_extract = saliencylevit.ExtractionModel(args.device)
+    feature_extract.to(args.device)
+    feature_extract.eval()
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model,feature_extract, device)
         print(
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
@@ -375,10 +381,11 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
+            model,feature_extract, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, args.clip_mode, model_ema, mixup_fn,
-            set_training_mode=args.finetune == '', patch_ratio=args.patch_ratio  # keep in eval mode during finetuning
+            # keep in eval mode during finetuning
+            set_training_mode=args.finetune == '', patch_ratio=args.patch_ratio
         )
 
         lr_scheduler.step(epoch)

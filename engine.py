@@ -16,20 +16,21 @@ from losses import DistillationLoss
 import utils
 
 
-def criterion_token(tokens_select,patch_ratio):
+def criterion_token(tokens_select, patch_ratio):
     token_mean = tokens_select.mean()
     token_flops_loss = ((token_mean - patch_ratio)**2).mean()
 
-    token_loss = token_flops_loss 
+    token_loss = token_flops_loss
     return token_loss
 
-def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
+
+def train_one_epoch(model: torch.nn.Module, feature_extract:torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     clip_grad: float = 0,
                     clip_mode: str = 'norm',
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True,patch_ratio=0.6):
+                    set_training_mode=True, patch_ratio=0.6):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(
@@ -39,6 +40,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
     for samples, targets in metric_logger.log_every(
             data_loader, print_freq, header):
+
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -46,9 +48,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             samples, targets = mixup_fn(samples, targets)
 
         if True:  # with torch.cuda.amp.autocast():
-            outputs,token_select = model(samples)
+            outputs, token_select = model(samples, feature_extract)
             loss = criterion(samples, outputs, targets)
-            loss_token=criterion_token(token_select,patch_ratio)
+            loss_token = criterion_token(token_select, patch_ratio)
 
         loss_value = loss.item()+loss_token.item()
 
@@ -75,9 +77,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+import matplotlib.pyplot as plt
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, patch_ratio=0.6):
+def evaluate(data_loader, model,feature_extract ,device, patch_ratio=0.6):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -89,15 +92,14 @@ def evaluate(data_loader, model, device, patch_ratio=0.6):
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-
+        # show_image(images[1])
         # compute output
         with torch.cuda.amp.autocast():
-            output,token_select = model(images)
+            output, token_select = model(images, feature_extract)
             loss = criterion(output, target)
             loss_token = criterion_token(token_select, patch_ratio)
 
         loss_value = loss.item()+loss_token.item()
-
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
