@@ -7,6 +7,7 @@ from functools import partial
 from torchvision.models.shufflenetv2 import (ShuffleNet_V2_X0_5_Weights,
                                              ShuffleNetV2, shufflenet_v2_x0_5)
 
+import matplotlib.pyplot as plt
 import numpy as np
 from timm.models.vision_transformer import Mlp, PatchEmbed , _cfg
 import torchvision
@@ -273,6 +274,41 @@ class vit_models(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+    def show_image(self, tensor):
+        numpy_img = tensor.cpu().numpy()
+
+        if len(numpy_img.shape) == 4:
+            numpy_img = numpy_img[0]
+        numpy_img = numpy_img.transpose((1, 2, 0))
+
+        if numpy_img.shape[2] == 1:
+            numpy_img = numpy_img.squeeze()
+
+        plt.imshow(numpy_img)
+        plt.show()
+
+    def show_map(self, tensor, feature_map):
+        numpy_img = tensor.cpu().numpy()
+        numpy_map = feature_map.cpu().numpy()
+
+        if len(numpy_img.shape) == 4:
+            numpy_img = numpy_img[0]
+            numpy_map = numpy_map[0]
+        numpy_img = numpy_img.transpose((1, 2, 0))
+        numpy_map = numpy_map.transpose((1, 2, 0))
+
+        if numpy_img.shape[2] == 1:
+            numpy_img = numpy_img.squeeze()
+        if numpy_map.shape[2] == 1:
+            numpy_map = numpy_map.squeeze()
+
+        plt.imshow(numpy_img)
+        plt.imshow(numpy_map, alpha=0.65)
+        plt.show()
+
+
+
+
     @torch.no_grad()
     def compute_errors(self, blured, image):
         squared_error = (blured - image) ** 2
@@ -283,25 +319,38 @@ class vit_models(nn.Module):
         original_size = x.shape[-1]
         return torchvision.transforms.functional.resize(torchvision.transforms.functional.resize(x, size, antialias=True), original_size, antialias=True)
 
-
-    def forward_features(self, x, feature_extract):
-        B = x.shape[0]
+    @torch.no_grad()
+    def forward_feature_extract(self, x, feature_extract):
+        B=x.shape[0]
         blured = self.blury_image(x, self.scale_size)
         blured_features = feature_extract(blured)
         image_features = feature_extract(x)
-
-        x = self.patch_embed(x)
         err = self.compute_errors(blured_features, image_features)
         err = err.reshape(B, -1)
+        return err
 
+    def select_indices(slef,err,batch_size):
         indices = torch.topk(err, 60, dim=1).indices
-
-
         indices = torch.sort(indices).values
+        batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, indices.shape[1])
+        batch_indices_pos = torch.arange(1).unsqueeze(
+            1).expand(-1, indices.shape[1])
+        return indices,batch_indices,batch_indices_pos
 
+    def forward_features(self, x, feature_extract):
+        B = x.shape[0]
+        # blured = self.blury_image(x, self.scale_size)
+        # blured_features = feature_extract(blured)
+        # image_features = feature_extract(x)
+        err=self.forward_feature_extract(x,feature_extract)
+        x = self.patch_embed(x)
+        # err = self.compute_errors(blured_features, image_features)
+        # err = err.reshape(B, -1)
 
-        batch_indices = torch.arange(B).unsqueeze(1).expand(-1, indices.shape[1])
-
+        # indices = torch.topk(err, 60, dim=1).indices
+        # indices = torch.sort(indices).values
+        # batch_indices = torch.arange(B).unsqueeze(1).expand(-1, indices.shape[1])
+        indices, batch_indices, batch_indices_pos=self.select_indices(err, B)
 
 
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -309,7 +358,7 @@ class vit_models(nn.Module):
         # print(x.shape)
         # print(self.pos_embed.shape)
         # print(batch_indices.shape)
-        batch_indices_pos = torch.arange(1).unsqueeze(1).expand(-1, indices.shape[1])
+        #batch_indices_pos = torch.arange(1).unsqueeze(1).expand(-1, indices.shape[1])
         pos = self.pos_embed[batch_indices_pos, indices, :]
         x = x + pos
         
