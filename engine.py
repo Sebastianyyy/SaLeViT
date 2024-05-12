@@ -95,11 +95,14 @@ def evaluate(data_loader, model,feature_extract ,device, patch_ratio=0.6):
         # show_image(images[1])
         # compute output
         with torch.cuda.amp.autocast():
-            output, token_select = model(images, feature_extract)
-            loss = criterion(output, target)
-            loss_token = criterion_token(token_select, patch_ratio)
+            # output, token_select = model(images, feature_extract)
+            output = model(images, feature_extract)
 
-        loss_value = loss.item()+loss_token.item()
+            loss = criterion(output, target)
+            # loss_token = criterion_token(token_select, patch_ratio)
+        loss_value = loss.item()
+
+        # loss_value = loss.item()+loss_token.item()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
