@@ -30,13 +30,17 @@ def train_one_epoch(model: torch.nn.Module, feature_extract:torch.nn.Module, cri
                     clip_grad: float = 0,
                     clip_mode: str = 'norm',
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True, patch_ratio=0.6):
+                    set_training_mode=True, patch_ratio=0.6, args=None):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(
         window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 100
+    
+    if args.cosub:
+        criterion = torch.nn.BCEWithLogitsLoss()
+
 
     for samples, targets in metric_logger.log_every(
             data_loader, print_freq, header):
@@ -46,13 +50,31 @@ def train_one_epoch(model: torch.nn.Module, feature_extract:torch.nn.Module, cri
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
+        if args.cosub:
+            samples = torch.cat((samples, samples), dim=0)
+        if args.bce_loss:
+            targets = targets.gt(0.0).type(targets.dtype)
 
-        if True:  # with torch.cuda.amp.autocast():
-            outputs, token_select = model(samples, feature_extract)
-            loss = criterion(samples, outputs, targets)
-            loss_token = criterion_token(token_select, patch_ratio)
+        #if True:  # with torch.cuda.amp.autocast():
+            #outputs, token_select = model(samples, feature_extract)
+            #loss = criterion(samples, outputs, targets)
+            #loss_token = criterion_token(token_select, patch_ratio)
+        with torch.cuda.amp.autocast():
+            outputs = model(samples)
+            if not args.cosub:
+                loss = criterion(samples, outputs, targets)
+            else:
+                outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
+                loss = 0.25 * criterion(outputs[0], targets)
+                loss = loss + 0.25 * criterion(outputs[1], targets)
+                loss = loss + 0.25 * \
+                    criterion(outputs[0], outputs[1].detach().sigmoid())
+                loss = loss + 0.25 * \
+                    criterion(outputs[1], outputs[0].detach().sigmoid())
 
-        loss_value = loss.item()+loss_token.item()
+        loss_value = loss.item()
+
+        # loss_value = loss.item()+loss_token.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -80,7 +102,7 @@ def train_one_epoch(model: torch.nn.Module, feature_extract:torch.nn.Module, cri
 import matplotlib.pyplot as plt
 
 @torch.no_grad()
-def evaluate(data_loader, model,feature_extract ,device, patch_ratio=0.6):
+def evaluate(data_loader, model, device, feature_extract):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -92,17 +114,11 @@ def evaluate(data_loader, model,feature_extract ,device, patch_ratio=0.6):
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        # show_image(images[1])
+
         # compute output
         with torch.cuda.amp.autocast():
-            # output, token_select = model(images, feature_extract)
             output = model(images, feature_extract)
-
             loss = criterion(output, target)
-            # loss_token = criterion_token(token_select, patch_ratio)
-        loss_value = loss.item()
-
-        # loss_value = loss.item()+loss_token.item()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
