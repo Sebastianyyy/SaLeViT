@@ -174,7 +174,7 @@ class hMLP_stem(nn.Module):
     
 
 class ExtractionModel(torch.nn.Module):
-    def __init__(self, device):
+    def __init__(self, device,stage_less=False):
         super().__init__()
         self.model = shufflenet_v2_x0_5(
             weights=ShuffleNet_V2_X0_5_Weights.DEFAULT)
@@ -187,6 +187,7 @@ class ExtractionModel(torch.nn.Module):
             self.model = self.model.to(self.device)
 
         self.model = self.model.eval()
+        self.stage_less=stage_less
 
     @torch.no_grad()
     def forward(self, x):
@@ -194,8 +195,9 @@ class ExtractionModel(torch.nn.Module):
         x = self.model.maxpool(x)
         x = self.model.stage2(x)
         x = self.model.stage3(x)
-        # x = self.model.stage4(x)
-        # x = self.model.conv5(x)
+        if not self.stage_less:
+            x = self.model.stage4(x)
+            x = self.model.conv5(x)
         return x
 
 
@@ -212,7 +214,7 @@ class vit_models(nn.Module):
                  Patch_layer=PatchEmbed,act_layer=nn.GELU,
                  Attention_block = Attention, Mlp_block=Mlp,
                 dpr_constant=True,init_scale=1e-4,
-                mlp_ratio_clstk = 4.0,**kwargs):
+                mlp_ratio_clstk = 4.0,show_images=False,stage_less=False,**kwargs):
         super().__init__()
         
         self.dropout_rate = drop_rate
@@ -244,8 +246,14 @@ class vit_models(nn.Module):
             
         self.norm = norm_layer(embed_dim)
 
+
+        self.show_images=show_images
+        self.stage_less=stage_less
+        
         self.feature_info = [dict(num_chs=embed_dim, reduction=0, module='head')]
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
@@ -326,11 +334,22 @@ class vit_models(nn.Module):
         blured_features = feature_extract(blured)
         image_features = feature_extract(x)
         err = self.compute_errors(blured_features, image_features)
+        
+        scale_image= 16 if self.stage_less else 32
+        if self.show_images:
+            err_show = err.repeat_interleave(
+                scale_image, dim=1).repeat_interleave(scale_image, dim=2)
+            err_show = err_show[:, None, :, :]
+            self.show_map(x, err_show)
+        if not self.stage_less:
+            err = err.repeat_interleave(
+                2, dim=1).repeat_interleave(2, dim=2)
         err = err.reshape(B, -1)
+        # print(err.shape)
         return err
 
     def select_indices(slef,err,batch_size):
-        indices = torch.topk(err, 60, dim=1).indices
+        indices = torch.topk(err, 64, dim=1).indices
         indices = torch.sort(indices).values
         batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, indices.shape[1])
         batch_indices_pos = torch.arange(1).unsqueeze(
@@ -346,7 +365,7 @@ class vit_models(nn.Module):
         x = self.patch_embed(x)
         # err = self.compute_errors(blured_features, image_features)
         # err = err.reshape(B, -1)
-
+        
         # indices = torch.topk(err, 60, dim=1).indices
         # indices = torch.sort(indices).values
         # batch_indices = torch.arange(B).unsqueeze(1).expand(-1, indices.shape[1])
@@ -432,7 +451,7 @@ def deit_medium_patch16_LS(pretrained=False, img_size=224, pretrained_21k = Fals
     return model 
 
 @register_model
-def deit_base_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+def deit_base_patch16_LS(pretrained=True, img_size=224, pretrained_21k = False,  **kwargs):
     model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
@@ -447,7 +466,6 @@ def deit_base_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,
             url=name,
             map_location="cpu", check_hash=True
         )
-        print(checkpoint['model']['cls_token'])
         model.load_state_dict(checkpoint["model"])
     return model
     
